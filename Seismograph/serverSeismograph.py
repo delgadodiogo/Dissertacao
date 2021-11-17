@@ -1,10 +1,22 @@
+import socket
+import tqdm
+import os
 import datetime
-import time
 import json
+import configparser 
 from influxdb import InfluxDBClient
-import paho.mqtt.client as mqtt
-import configparser
+import requests
+import time
+import urllib.request as urllib2
+import select
 
+c = 0
+# device's IP address
+SERVER_HOST = "192.168.1.204"
+SERVER_PORT = 5001
+# receive 4096 bytes each time
+BUFFER_SIZE = 4096
+SEPARATOR = "<SEPARATOR>"
 
 json_list = []
 config = None
@@ -19,14 +31,6 @@ def get_config():
     # [ADMIN]
     global ADMIN_EMAIL
 
-    # [MQTT]
-    global BROKER_ADDRESS
-    global BROKER_PORT
-    global BROKER_USERNAME
-    global BROKER_PASSWORD
-    global MQTT_CLIENTID
-    global MQTT_TOPIC
-    global QOS
 
     # [InfluxDB]
     global INFLUXDB_ADDRESS
@@ -36,21 +40,13 @@ def get_config():
 
     global flag
     flag = 0
-    # Instantiate config
+
     config_parser = configparser.ConfigParser()
     config_parser.read('SeismographConfiguration.ini')
 
     # [ADMIN]
     ADMIN_EMAIL = config_parser.get('ADMIN', 'Admin_email')
 
-    # [MQTT]
-    BROKER_ADDRESS = config_parser.get('MQTT', 'Broker_Address')
-    BROKER_PORT = config_parser.getint('MQTT', 'Broker_Port')
-    BROKER_USERNAME = config_parser.get('MQTT', 'Broker_Username')
-    BROKER_PASSWORD = config_parser.get('MQTT', 'Broker_Password')
-    MQTT_CLIENTID = config_parser.get('MQTT', 'MQTT_ClientID')
-    MQTT_TOPIC = config_parser.get('MQTT', 'MQTT_Topic')
-    QOS = config_parser.getint('MQTT', 'QoS')
 
     # [InfluxDB]
     INFLUXDB_ADDRESS = config_parser.get('InfluxDB', 'InfluxDB_Adress')
@@ -59,87 +55,171 @@ def get_config():
     INFLUXDB_TIME_PRECISION = config_parser.get('InfluxDB', 'InfluxDB_Time_Precision')
 
 
-def on_connect(client, userdata, flags, rc):
-    """
-    Callback function for connection with the broker
+def checkInternet():
 
-    :param Client client: The client instance for this callback
-    :param dict userdata: The private user data as set in Client() or user_data_set()
-    :param dict flags: Response flags sent by the broker
-    :param int rc: The connection result
-    :return:
-    """
-    print('Connected With The Broker.')
-    client.subscribe(MQTT_TOPIC, qos=QOS)
-
-
-def on_message_from_seismograph(client, userdata, message):
-    """
-    Callback function for magnetometer message
-
-    :param Client client: The client instance for this callback
-    :param dict userdata: The private user data as set in Client() or user_data_set()
-    :param MQTTMessage message: Message
-    """
-    global flag
-    flag = flag + 1
-    print(flag)
-    print('Message Receieved from Seismograph: ' + message.payload.decode())
-    store_in_db(message.payload.decode())
-
-
-def on_message(client, userdata, message):
-    """
-    Callback function for other messages message
-
-    :param Client client: The client instance for this callback
-    :param dict userdata: The private user data as set in Client() or user_data_set()
-    :param MQTTMessage message: Message
-    """
-    print('Message Recieved from Others: ' + message.payload.decode())
-
-
-def on_log(client, userdata, level, buf):
-    """
-    Callback function for logs
-
-    :param Client client: The client instance for this callback
-    :param dict userdata: The private user data as set in Client() or user_data_set()
-    :param dict level: The severity of the message
-    :param str buf: The message itself
-    """
-    print('log: ' + buf)
-
+    try:
+        urllib2.urlopen('http://216.58.209.78', timeout=1)
+        print("is up")
+        time.sleep(60)
+        main()
+    except urllib2.URLError as err: 
+        print("is down")
+        time.sleep(60)
+        checkInternet() 
 
 def main():
-    """
-    Main function
-    """
+
+    global influxdb_client
+    global i
+    i=0
     # Get variables values from INI file
     get_config()
 
-    # Connect with the broker
-    initialize_broker_connection()
+    # Instantiate a connection to the InfluxDB
+    influxdb_client = InfluxDBClient(host=INFLUXDB_ADDRESS, port=INFLUXDB_PORT, database=INFLUXDB_DATABASE)
+    influxdb_client.create_database(INFLUXDB_DATABASE)
 
 
-def initialize_broker_connection():
-    """
-    Connect with the broker
-    """
-    global client
-    client = mqtt.Client(client_id=MQTT_CLIENTID, clean_session=False)  # Create new MQTT client instance
-    client.username_pw_set(username=BROKER_USERNAME, password=BROKER_PASSWORD)  # Set credentials
-    client.on_connect = on_connect   # Define connect callback function
-    client.on_message = on_message   # Define message callback function
-    try:
-        client.connect(BROKER_ADDRESS, BROKER_PORT)  # Connect to the broker
-    except:
-        print('ERROR: Error while connecting with the broker.')
-        raise Exception('BrokerConnectionError')
+    #Main function
+
+    # Get variables values from INI file
+
+    # create the server socket
+    # TCP socket
+    s = socket.socket()
+    print("here")
     
-    client.subscribe(MQTT_TOPIC, qos=QOS)  # Subscribe to topic
-    client.message_callback_add(MQTT_TOPIC, on_message_from_seismograph)  # Define magnetometer message callback function
-    client.loop_forever()
+    # bind the socket to our local address
+    s.bind((SERVER_HOST, SERVER_PORT))
+
+
+    while True:
+
+        # enabling our server to accept connections
+        # 5 here is the number of unaccepted connections that
+        # the system will allow before refusing new connections
+        s.listen(5)
+        print(f"[*] Listening as {SERVER_HOST}:{SERVER_PORT}")
+            
+
+        # accept connection if there is any
+        client_socket, address = s.accept()
+        # if below code is executed, that means the sender is connected
+        print(f"[+] {address} is connected.")
+
+
+        # receive the file infos
+        # receive using client socket, not server socket
+        received = client_socket.recv(BUFFER_SIZE).decode()
+        filename, filesize = received.split(SEPARATOR)
+        # remove absolute path if there is
+        filename = os.path.basename(filename)
+        # convert to integer
+        filesize = int(filesize)
+
+        # start receiving the file from the socket
+        # and writing to the file stream
+        progress = tqdm.tqdm(range(filesize), f"Receiving {filename}", unit="B", unit_scale=True, unit_divisor=1024)
+        with open(filename, "wb") as f:
+            while True:
+                # read 1024 bytes from the socket (receive)
+                bytes_read = client_socket.recv(BUFFER_SIZE)
+                if not bytes_read:    
+                    # nothing is received
+                    # file transmitting is done
+                    break
+                # write to the file the bytes we just received
+                f.write(bytes_read)
+                # update the progress bar
+                progress.update(len(bytes_read))
+
+        if os.path.getsize(filename) == filesize: 
+            print("received")
+            break
+        else:
+            print("connection failure")
+
+    print("there")
+    # close the client socket
+    client_socket.close()
+    # close the server socket
+    s.close() 
+
+
+    #Save the values from the text file into the database
+    with open(filename,'r') as f:
+        lines = f.readlines()
+
+    month = lines[0][12:14]
+    day = lines[0][15:17]
+    year = lines[0][18:20]
+
+    hour = lines[0][21:23]
+    min = lines[0][24:26]
+    sec = lines[0][27:29]
+
+    date_string = month + "/" + day + "/20" + year + " " + hour + ":" + min + ":" + sec
+    date = datetime.datetime.strptime(date_string, "%m/%d/%Y %H:%M:%S")
+    timestamp = datetime.datetime.timestamp(date)
+    timestamp = timestamp * 1000
+
+    with open(filename,'r') as f:
+        for line in lines[4:]:
+            if line:
+                if line != "\n":
+                    json_body = parse(line, timestamp)
+                    timestamp = timestamp + 10
+                    store_in_db(json_body)
+    
+    main()
+
+
+def parse(line, timestamp):
+    """
+    Parse the received message
+
+    :param message: Received message
+    """
+    
+
+    value = [0 for i in range(6)] 
+    value = line.split(",")
+    value[5] = value[5].rstrip("\n")
+    #print(value)
+
+    json_body = generate_json(value, timestamp)
+    return json_body
+
+
+def generate_json(value, ut):
+    """
+    Build JSON to store in DB
+
+    :param value: X, Y and Z component for each type of seismograph (LP and SP)
+    :param ut: Unix-Timestamp
+    """
+    global json_list
+    json_body = {
+            "measurement": "Seismograph_Data",
+            "tags": {
+                "Long-Period_Instrument": "XPTO_LP",
+                "Short-Period_Instrument": "XPTO_SP",
+                "Measurement": "u"
+            },
+            "time":int(ut),
+            "fields": {
+                "LP_X": int(value[0]),
+                "LP_Y": int(value[1]),
+                "LP_Z": int(value[2]),
+                "SP_X": int(value[3]),
+                "SP_Y": int(value[4]),
+                "SP_Z": int(value[5])
+            }
+        }
+
+    json_body = json.dumps(json_body)
+
+    return json_body
 
 
 def store_in_db(message):
@@ -147,22 +227,19 @@ def store_in_db(message):
     Store in the database
     """
     global json_list
+    global influxdb_client
+    global i
 
     json_obj = json.loads(message)
     json_list.append(json_obj)
 
-    # Instantiate a connection to the InfluxDB
-    influxdb_client = InfluxDBClient(host=INFLUXDB_ADDRESS, port=INFLUXDB_PORT, database=INFLUXDB_DATABASE)
-    influxdb_client.create_database(INFLUXDB_DATABASE)
 
     # Save measurement in the database
-    #print('Write points: {0}'.format(json_list))
+    i+=1
+    print(i)
     influxdb_client.write_points(json_list, time_precision=INFLUXDB_TIME_PRECISION, protocol='json')
     json_list = []
 
-    #results = influxdb_client.query('select LP_X from Seismograph_Data;')
-    #print ("Result: {0}".format(results))
 
 if __name__ == '__main__':
     main()
-
